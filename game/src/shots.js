@@ -1,79 +1,115 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
+// The screenshot scenes behind ?shot=start|play|end. Each one plays the real
+// rules forward from a fresh sortie for a fixed stretch, steered by a simple
+// autopilot (point the nose at the next ring's altitude, hold a cruise speed,
+// ride the glide slope onto runway B), so the frame is what a real flight
+// looks like and the same seed always gives the same frame.
+//
+// start: parked on runway A, engine idling, title panel up.
+// play:  a full takeoff and ring run, frozen mid-flight over Tanjung Town.
+// end:   a staged final approach onto runway B, flared and landed.
+
+import { RUNWAYS, STEP } from './config.js';
 import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+const START_SECONDS = 3;
+const PLAY_MAX_SECONDS = 130;
+const PLAY_FREEZE_X = 5600; // freeze the frame over the town, ring 3 ahead
+const END_MAX_SECONDS = 90; // firm glide-slope flying lands in ~30 s; the cap is slack
+const END_STAGE = { x: 10200, alt: 150, speed: 40, throttle: 0.35 };
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+/** Pitch and throttle that chase a desired altitude and speed. Gentle gains
+ *  keep the nose near level, which is what a frozen screenshot wants. */
+function flyToward(plane, desiredAlt, desiredSpeed) {
+  const altError = desiredAlt - plane.alt;
+  const pitch = Math.max(-0.6, Math.min(0.6, altError * 0.012 - plane.vspeed * 0.1));
+  const speedError = desiredSpeed - plane.speed;
+  const throttleDelta = Math.max(-1, Math.min(1, speedError * 0.06));
+  return { throttleDelta, pitchCommand: pitch };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+/** The same chase with firm gains: the landing scene must ride the glide
+ *  slope down firmly and flare, not float above it. */
+function flyTowardFirm(plane, desiredAlt, desiredSpeed) {
+  const altError = desiredAlt - plane.alt;
+  const pitch = Math.max(-0.8, Math.min(0.8, altError * 0.03 - plane.vspeed * 0.05));
+  const speedError = desiredSpeed - plane.speed;
+  const throttleDelta = Math.max(-1, Math.min(1, speedError * 0.06));
+  return { throttleDelta, pitchCommand: pitch };
+}
+
+function autopilot(flight) {
+  const plane = flight.plane;
+  const nextRing = flight.rings[plane.ringIndex];
+  if (plane.grounded) {
+    // On the runway: full throttle, pull up once she is fast enough to fly.
+    return { throttleDelta: 1, pitchCommand: plane.speed >= 17 ? 1 : 0 };
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
+  if (nextRing) {
+    const ahead = nextRing.x - plane.x;
+    const desiredAlt = ahead < 1500 ? nextRing.alt : 120;
+    return flyToward(plane, desiredAlt, 44);
   }
-  return best;
+  // Rings done: hold a cruise altitude and speed toward the far runway.
+  return flyToward(plane, 110, 40);
+}
+
+/** Glide-slope autopilot for the landing scene: ride a steady slope down to
+ *  the runway threshold, then flare flat over the strip. */
+function landingAutopilot(flight) {
+  const plane = flight.plane;
+  const threshold = RUNWAYS[1].x0;
+  const toThreshold = threshold - plane.x;
+  if (plane.grounded) return { throttleDelta: -1, pitchCommand: 0 };
+  const desiredAlt = toThreshold > 150 ? 6 + toThreshold * 0.12 : 6 + Math.max(0, toThreshold) * 0.02;
+  return flyTowardFirm(plane, desiredAlt, 30);
 }
 
 /**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
+ * Set `flight` to the named scene (start, play or end; any other name is
+ * start) and return the screen to draw over it and the best score to show.
  */
-export function stageShot(name, world) {
-  world.reset();
+export function stageShot(name, flight) {
+  flight.reset();
+  const plane = flight.plane;
+
   if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
+    // Parked, engine idling at 30%, prop turning: the title scene.
+    plane.throttle = 0.3;
+    for (let i = 0; i < START_SECONDS / STEP; i += 1) {
+      flight.step(STEP, { throttleDelta: 0, pitchCommand: 0 });
+    }
     return { screen: SCREEN_TITLE, best: 0 };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'play') {
+    for (let i = 0; i < PLAY_MAX_SECONDS / STEP; i += 1) {
+      flight.step(STEP, autopilot(flight));
+      if (plane.x >= PLAY_FREEZE_X || plane.state === 'crashed') break;
+    }
+    return { screen: SCREEN_PLAY, best: flight.sortie.score };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  // end: place the plane on final approach to runway B and fly her down.
+  plane.x = END_STAGE.x;
+  plane.alt = END_STAGE.alt;
+  plane.speed = END_STAGE.speed;
+  plane.throttle = END_STAGE.throttle;
+  plane.pitch = -0.08;
+  plane.grounded = false;
+  plane.state = 'flying';
+  plane.fuel = 60;
+  plane.ringIndex = flight.rings.length;
+  for (const ring of flight.rings) ring.done = true;
+  flight.sortie.leg = 2;
+  flight.sortie.ringsDone = flight.rings.length;
+  for (let i = 0; i < END_MAX_SECONDS / STEP; i += 1) {
+    flight.step(STEP, landingAutopilot(flight));
+    if (plane.state === 'landed') {
+      // Two seconds of rollout so the panel reads over a stopped plane.
+      for (let j = 0; j < 2 / STEP; j += 1) flight.step(STEP, { throttleDelta: -1, pitchCommand: 0 });
+      break;
+    }
+    if (plane.state === 'crashed') break;
+  }
+  return { screen: SCREEN_OVER, best: flight.sortie.score };
 }

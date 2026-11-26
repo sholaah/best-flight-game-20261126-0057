@@ -1,28 +1,71 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Boot and the one loop: input is read every frame, the flight advances in
+// fixed 1/60 s steps (several in a slow frame, none in a fast one), and the
+// renderer paints what is there. The game moves between four screens: title,
+// play, paused and sortie over (landed or crashed).
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the island chain. ?shot=start|play|end (with &seed=N) stages
+// that scene instead of running the loop, paints it twice and sets
+// window.__shotReady for a screenshot.
+
+import { BEST_KEY, RINGS, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
+import { createTerrain } from './terrain.js';
+import { createAircraft, EVENT_CRASHED, EVENT_LANDED, EVENT_RING } from './aircraft.js';
+import { createSortie } from './missions.js';
+import { ACTION_CONFIRM, ACTION_DROP, ACTION_PAUSE, createInput } from './input.js';
+import { createAudio } from './audio.js';
 import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 import { stageShot } from './shots.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
+/** The chain is the same every visit unless a seed is asked for. */
+const DEFAULT_SEED = 20261126;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : DEFAULT_SEED;
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+
+/** One flight: terrain, plane, sortie and the clock, stepped together. */
+function createFlight(seedValue) {
+  const random = createRandom(seedValue);
+  const terrain = createTerrain(random);
+  // One rings array, shared by the aircraft (which detects fly-throughs) and
+  // the sortie (which scores them and draws them).
+  const rings = RINGS.map((ring) => ({ ...ring, done: false }));
+  const aircraft = createAircraft(terrain, rings);
+  const plane = aircraft.state;
+  const sortie = createSortie(plane, rings);
+  const flight = {
+    plane,
+    sortie: sortie.sortie,
+    rings,
+    terrain,
+    elapsed: 0,
+    reset() {
+      aircraft.reset();
+      sortie.reset();
+      flight.elapsed = 0;
+    },
+    step(dt, controls) {
+      flight.elapsed += dt;
+      const events = aircraft.step(dt, controls, flight.elapsed);
+      sortie.applyEvents(events, flight.elapsed);
+      return events;
+    },
+  };
+  return flight;
+}
+
+const flight = createFlight(seed);
+const renderer = createRenderer(canvas, flight.terrain);
+const audio = createAudio();
+// The title scene idles with the engine turning over, prop spinning.
+flight.plane.throttle = 0.3;
 
 function readBest() {
   try {
@@ -41,15 +84,20 @@ function saveBest(value) {
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+  const scene = stageShot(name, flight);
+  // Paint synchronously, twice, so the frame is on the canvas by the time the
+  // page finishes loading — headless screenshots must not wait on rAF.
+  for (let painted = 0; painted < 2; painted += 1) {
+    renderer.draw({
+      plane: flight.plane,
+      sortie: flight.sortie,
+      rings: flight.rings,
+      screen: scene.screen,
+      best: scene.best,
+      elapsed: flight.elapsed,
+    });
   }
-  requestAnimationFrame(paint);
+  window.__shotReady = true;
 }
 
 function runGame() {
@@ -59,47 +107,67 @@ function runGame() {
   let accumulator = 0;
   let last = performance.now();
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
   function announce(message) {
     status.textContent = message;
   }
 
-  function startGame() {
-    world.reset();
+  function startSortie() {
+    flight.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    announce('Flying. Take off from runway A, then fly the rings.');
   }
 
-  function endGame() {
+  function endSortie() {
     screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
+    if (flight.sortie.score > best) {
+      best = flight.sortie.score;
       saveBest(best);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+    announce(
+      flight.plane.state === 'crashed'
+        ? `Crashed. ${flight.plane.crashReason} Score ${flight.sortie.score}.`
+        : `Sortie complete. Score ${flight.sortie.score}. Best ${best}.`,
+    );
   }
 
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
+    if (actions & ACTION_DROP) {
+      audio.unlock();
+      if (screen === SCREEN_PLAY) {
+        if (flight.sortie.tryDrop(flight.elapsed)) audio.dropThud();
+      } else if (screen === SCREEN_TITLE || screen === SCREEN_OVER) {
+        startSortie();
+      }
+    }
+    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) {
+      audio.unlock();
+      startSortie();
+    } else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
       announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
+    } else if (actions & ACTION_PAUSE && screen === SCREEN_PAUSED) {
       screen = SCREEN_PLAY;
       announce('Playing.');
     }
   }
 
   function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
+    const controls = {
+      throttleDelta: input.throttleDelta(),
+      pitchCommand: input.pitchCommand(canvas.clientHeight),
+    };
+    const events = flight.step(STEP, controls);
+    if (events & EVENT_RING) audio.chime();
+    if (events & EVENT_LANDED) {
+      audio.landThud();
+      endSortie();
+    } else if (events & EVENT_CRASHED) {
+      audio.crashBang();
+      endSortie();
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    audio.setFlight(flight.plane.throttle, flight.plane.speed, !flight.plane.grounded);
   }
 
   function frame(now) {
@@ -107,18 +175,29 @@ function runGame() {
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
     handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
+    if (screen === SCREEN_TITLE) {
+      // The title scene idles: the prop turns, the clouds drift, the plane waits.
+      flight.elapsed += STEP;
+      flight.plane.propAngle += (2 + flight.plane.throttle * 38) * STEP;
+    } else if (screen === SCREEN_PLAY) {
+      while (accumulator >= STEP && screen === SCREEN_PLAY) {
         step();
         accumulator -= STEP;
       }
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw({
+      plane: flight.plane,
+      sortie: flight.sortie,
+      rings: flight.rings,
+      screen,
+      best,
+      elapsed: flight.elapsed,
+    });
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
+  // Leaving the tab pauses a running sortie rather than letting fuel burn unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -126,7 +205,7 @@ function runGame() {
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Island Hopper. Press Space or click to fly.');
   requestAnimationFrame(frame);
 }
 
